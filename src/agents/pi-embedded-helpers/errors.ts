@@ -831,3 +831,15 @@ export function isFailoverAssistantError(msg: AssistantMessage | undefined): boo
   }
   return isFailoverErrorMessage(msg.errorMessage ?? "");
 }
+
+
+export function isCorruptedThoughtSignatureError(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  const lower = raw.toLowerCase();
+  return (
+    lower.includes("corrupted thought signature") ||
+    (lower.includes("invalid_argument") && lower.includes("thought_signature"))
+  );
+}
