@@ -8,9 +8,9 @@ import {
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
+import { sendMediaFeishu } from "./media.js";
 import type { MentionTarget } from "./mention.js";
 import { buildMentionedCardContent } from "./mention.js";
-import { getReactionStateManager } from "./reaction-state.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
 import { FeishuStreamingSession } from "./streaming-card.js";
@@ -22,31 +22,97 @@ function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
 }
 
+/** Maximum age (ms) for a message to receive a typing indicator reaction.
+ * Messages older than this are likely replays after context compaction (#30418). */
+const TYPING_INDICATOR_MAX_AGE_MS = 2 * 60_000;
+const MS_EPOCH_MIN = 1_000_000_000_000;
+
+function normalizeEpochMs(timestamp: number | undefined): number | undefined {
+  if (!Number.isFinite(timestamp) || timestamp === undefined || timestamp <= 0) {
+    return undefined;
+  }
+  // Defensive normalization: some payloads use seconds, others milliseconds.
+  // Values below 1e12 are treated as epoch-seconds.
+  return timestamp < MS_EPOCH_MIN ? timestamp * 1000 : timestamp;
+}
+
 export type CreateFeishuReplyDispatcherParams = {
   cfg: ClawdbotConfig;
   agentId: string;
   runtime: RuntimeEnv;
   chatId: string;
   replyToMessageId?: string;
+  /** When true, preserve typing indicator on reply target but send messages without reply metadata */
+  skipReplyToInMessages?: boolean;
+  replyInThread?: boolean;
+  /** True when inbound message is already inside a thread/topic context */
+  threadReply?: boolean;
+  rootId?: string;
   mentionTargets?: MentionTarget[];
   accountId?: string;
+  /** Epoch ms when the inbound message was created. Used to suppress typing
+   *  indicators on old/replayed messages after context compaction (#30418). */
+  messageCreateTimeMs?: number;
 };
 
 export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams) {
   const core = getFeishuRuntime();
-  const { cfg, agentId, chatId, replyToMessageId, mentionTargets, accountId } = params;
+  const {
+    cfg,
+    agentId,
+    chatId,
+    replyToMessageId,
+    skipReplyToInMessages,
+    replyInThread,
+    threadReply,
+    rootId,
+    mentionTargets,
+    accountId,
+  } = params;
+  const sendReplyToMessageId = skipReplyToInMessages ? undefined : replyToMessageId;
+  const threadReplyMode = threadReply === true;
+  const effectiveReplyInThread = threadReplyMode ? true : replyInThread;
   const account = resolveFeishuAccount({ cfg, accountId });
   const prefixContext = createReplyPrefixContext({ cfg, agentId });
 
+  let typingState: TypingIndicatorState | null = null;
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
-      // NOTE: onProcessingStart is handled in onReplyStart via processingTransitionPromise.
-      // Do NOT call it here — the SDK calls start() periodically to refresh typing state,
-      // which would produce redundant API calls and "not in QUEUED status" log spam.
+      // Check if typing indicator is enabled (default: true)
+      if (!(account.config.typingIndicator ?? true)) {
+        return;
+      }
+      if (!replyToMessageId) {
+        return;
+      }
+      // Skip typing indicator for old messages — likely replays after context
+      // compaction that would flood users with stale notifications (#30418).
+      const messageCreateTimeMs = normalizeEpochMs(params.messageCreateTimeMs);
+      if (
+        messageCreateTimeMs !== undefined &&
+        Date.now() - messageCreateTimeMs > TYPING_INDICATOR_MAX_AGE_MS
+      ) {
+        return;
+      }
+      // Feishu reactions persist until explicitly removed, so skip keepalive
+      // re-adds when a reaction already exists. Re-adding the same emoji
+      // triggers a new push notification for every call (#28660).
+      if (typingState?.reactionId) {
+        return;
+      }
+      typingState = await addTypingIndicator({
+        cfg,
+        messageId: replyToMessageId,
+        accountId,
+        runtime: params.runtime,
+      });
     },
     stop: async () => {
-      // Cleanup is properly handled inside deliver() and closeStreaming() for accurate timing
-      // when the message is fully sent, avoiding premature disappearance.
+      if (!typingState) {
+        return;
+      }
+      await removeTypingIndicator({ cfg, state: typingState, accountId, runtime: params.runtime });
+      typingState = null;
     },
     onStartError: (err) =>
       logTypingFailure({
@@ -70,16 +136,57 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const chunkMode = core.channel.text.resolveChunkMode(cfg, "feishu");
   const tableMode = core.channel.text.resolveMarkdownTableMode({ cfg, channel: "feishu" });
   const renderMode = account.config?.renderMode ?? "auto";
-  const streamingEnabled = account.config?.streaming !== false && renderMode !== "raw";
+  // Card streaming may miss thread affinity in topic contexts; use direct replies there.
+  const streamingEnabled =
+    !threadReplyMode && account.config?.streaming !== false && renderMode !== "raw";
 
   let streaming: FeishuStreamingSession | null = null;
   let streamText = "";
   let lastPartial = "";
   let partialUpdateQueue: Promise<void> = Promise.resolve();
   let streamingStartPromise: Promise<void> | null = null;
-  // Promise for the QUEUED→PROCESSING transition (onProcessingStart API calls).
-  // Saved here so deliver() can await it before sending content.
-  let processingTransitionPromise: Promise<void> | null = null;
+
+  const mergeStreamingText = (nextText: string) => {
+    if (!streamText) {
+      streamText = nextText;
+      return;
+    }
+    if (nextText.startsWith(streamText)) {
+      // Handle cumulative partial payloads where nextText already includes prior text.
+      streamText = nextText;
+      return;
+    }
+    if (streamText.endsWith(nextText)) {
+      return;
+    }
+    streamText += nextText;
+  };
+
+  const queueStreamingUpdate = (
+    nextText: string,
+    options?: {
+      dedupeWithLastPartial?: boolean;
+    },
+  ) => {
+    if (!nextText) {
+      return;
+    }
+    if (options?.dedupeWithLastPartial && nextText === lastPartial) {
+      return;
+    }
+    if (options?.dedupeWithLastPartial) {
+      lastPartial = nextText;
+    }
+    mergeStreamingText(nextText);
+    partialUpdateQueue = partialUpdateQueue.then(async () => {
+      if (streamingStartPromise) {
+        await streamingStartPromise;
+      }
+      if (streaming?.isActive()) {
+        await streaming.update(streamText);
+      }
+    });
+  };
 
   const startStreaming = () => {
     if (!streamingEnabled || streamingStartPromise || streaming) {
@@ -98,7 +205,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         params.runtime.log?.(`feishu[${account.accountId}] ${message}`),
       );
       try {
-        await streaming.start(chatId, resolveReceiveIdType(chatId));
+        await streaming.start(chatId, resolveReceiveIdType(chatId), {
+          replyToMessageId,
+          replyInThread: effectiveReplyInThread,
+          rootId,
+        });
       } catch (error) {
         params.runtime.error?.(`feishu: streaming start failed: ${String(error)}`);
         streaming = null;
@@ -106,37 +217,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     })();
   };
 
-  // Track whether onCompleted has already been called for this dispatcher lifecycle.
-  // Prevents double-cleanup from both deliver() and closeStreaming()/onIdle paths.
-  let reactionCompleted = false;
-
-  const completeReaction = () => {
-    if (reactionCompleted || !replyToMessageId) return;
-    reactionCompleted = true;
-    const mgr = getReactionStateManager();
-    // Clean up THIS message's reaction.
-    mgr.onCompleted(replyToMessageId).catch(() => {});
-
-    // Note: We purposely DO NOT clear other merged messages here. Their emojis
-    // will either be handled by clearerForChat when the actual main response
-    // arrives, or handled by stale cleanup if the main response is somehow lost.
-    // Clearing them here by cutoffTimestamp causes a race condition where a message
-    // that fails (replies=0) accidentally clears the typing indicator for the message
-    // that is still genuinely being processed.
-  };
-
   const closeStreaming = async () => {
     if (streamingStartPromise) {
       await streamingStartPromise;
     }
     await partialUpdateQueue;
-    const hadActiveStream = streaming?.isActive() ?? false;
-    if (hadActiveStream) {
+    if (streaming?.isActive()) {
       let text = streamText;
       if (mentionTargets?.length) {
         text = buildMentionedCardContent(mentionTargets, text);
       }
-      await streaming!.close(text);
+      await streaming.close(text);
     }
     streaming = null;
     streamingStartPromise = null;
@@ -153,103 +244,128 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         if (streamingEnabled && renderMode === "card") {
           startStreaming();
         }
-        // Save the processing transition promise so deliver() can await it.
-        // onReplyStart must return void (SDK contract), so we fire-and-forget here,
-        // but capture the promise for synchronization in deliver().
-        if (replyToMessageId && !processingTransitionPromise) {
-          processingTransitionPromise = getReactionStateManager()
-            .onProcessingStart(replyToMessageId)
-            .catch((err) => {
-              params.runtime.log?.(
-                `Failed to transition reaction state for ${replyToMessageId}: ${err}`,
-              );
-            });
-        }
         void typingCallbacks.onReplyStart?.();
       },
       deliver: async (payload: ReplyPayload, info) => {
-        // FR-001: Ensure the QUEUED→PROCESSING emoji transition completes BEFORE
-        // we deliver any content. Without this await, deliver() races ahead of
-        // onProcessingStart()'s API calls and completeReaction() removes the emoji
-        // before Typing ever appears.
-        if (processingTransitionPromise) {
-          await processingTransitionPromise;
-          processingTransitionPromise = null;
-        }
-
         const text = payload.text ?? "";
-        if (!text.trim()) {
-          // If the agent decides to output nothing, we still need to clear the reaction
-          completeReaction();
+        const mediaList =
+          payload.mediaUrls && payload.mediaUrls.length > 0
+            ? payload.mediaUrls
+            : payload.mediaUrl
+              ? [payload.mediaUrl]
+              : [];
+        const hasText = Boolean(text.trim());
+        const hasMedia = mediaList.length > 0;
+
+        if (!hasText && !hasMedia) {
           return;
         }
 
-        const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+        if (hasText) {
+          const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
 
-        if ((info?.kind === "block" || info?.kind === "final") && streamingEnabled && useCard) {
-          startStreaming();
-          if (streamingStartPromise) {
-            await streamingStartPromise;
+          if (info?.kind === "block") {
+            // Drop internal block chunks unless we can safely consume them as
+            // streaming-card fallback content.
+            if (!(streamingEnabled && useCard)) {
+              return;
+            }
+            startStreaming();
+            if (streamingStartPromise) {
+              await streamingStartPromise;
+            }
+          }
+
+          if (info?.kind === "final" && streamingEnabled && useCard) {
+            startStreaming();
+            if (streamingStartPromise) {
+              await streamingStartPromise;
+            }
+          }
+
+          if (streaming?.isActive()) {
+            if (info?.kind === "block") {
+              // Some runtimes emit block payloads without onPartial/final callbacks.
+              // Mirror block text into streamText so onIdle close still sends content.
+              queueStreamingUpdate(text);
+            }
+            if (info?.kind === "final") {
+              streamText = text;
+              await closeStreaming();
+            }
+            // Send media even when streaming handled the text
+            if (hasMedia) {
+              for (const mediaUrl of mediaList) {
+                await sendMediaFeishu({
+                  cfg,
+                  to: chatId,
+                  mediaUrl,
+                  replyToMessageId: sendReplyToMessageId,
+                  replyInThread: effectiveReplyInThread,
+                  accountId,
+                });
+              }
+            }
+            return;
+          }
+
+          let first = true;
+          if (useCard) {
+            for (const chunk of core.channel.text.chunkTextWithMode(
+              text,
+              textChunkLimit,
+              chunkMode,
+            )) {
+              await sendMarkdownCardFeishu({
+                cfg,
+                to: chatId,
+                text: chunk,
+                replyToMessageId: sendReplyToMessageId,
+                replyInThread: effectiveReplyInThread,
+                mentions: first ? mentionTargets : undefined,
+                accountId,
+              });
+              first = false;
+            }
+          } else {
+            const converted = core.channel.text.convertMarkdownTables(text, tableMode);
+            for (const chunk of core.channel.text.chunkTextWithMode(
+              converted,
+              textChunkLimit,
+              chunkMode,
+            )) {
+              await sendMessageFeishu({
+                cfg,
+                to: chatId,
+                text: chunk,
+                replyToMessageId: sendReplyToMessageId,
+                replyInThread: effectiveReplyInThread,
+                mentions: first ? mentionTargets : undefined,
+                accountId,
+              });
+              first = false;
+            }
           }
         }
 
-        if (streaming?.isActive()) {
-          if (info?.kind === "final") {
-            streamText = text;
-            await closeStreaming();
-            // FR-001: "分发完成 → onCompleted()" — streaming reply fully delivered
-            completeReaction();
-          }
-          return;
-        }
-
-        let first = true;
-        if (useCard) {
-          for (const chunk of core.channel.text.chunkTextWithMode(
-            text,
-            textChunkLimit,
-            chunkMode,
-          )) {
-            await sendMarkdownCardFeishu({
+        if (hasMedia) {
+          for (const mediaUrl of mediaList) {
+            await sendMediaFeishu({
               cfg,
               to: chatId,
-              text: chunk,
-              replyToMessageId,
-              mentions: first ? mentionTargets : undefined,
+              mediaUrl,
+              replyToMessageId: sendReplyToMessageId,
+              replyInThread: effectiveReplyInThread,
               accountId,
             });
-            first = false;
-          }
-        } else {
-          const converted = core.channel.text.convertMarkdownTables(text, tableMode);
-          for (const chunk of core.channel.text.chunkTextWithMode(
-            converted,
-            textChunkLimit,
-            chunkMode,
-          )) {
-            await sendMessageFeishu({
-              cfg,
-              to: chatId,
-              text: chunk,
-              replyToMessageId,
-              mentions: first ? mentionTargets : undefined,
-              accountId,
-            });
-            first = false;
           }
         }
-
-        // FR-001: "分发完成 → onCompleted()" — non-streaming reply fully delivered
-        completeReaction();
       },
       onError: async (error, info) => {
         params.runtime.error?.(
           `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
         );
-
         await closeStreaming();
-        // Ensure reaction is cleared on error so it doesn't get stuck
-        completeReaction();
         typingCallbacks.onIdle?.();
       },
       onIdle: async () => {
@@ -258,16 +374,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       },
       onCleanup: () => {
         typingCallbacks.onCleanup?.();
-        // FR-001 Fallback: call completeReaction only if reactionCompleted hasn't been
-        // called yet (i.e. deliver() was never invoked - e.g. message tool bypass path).
-        // This handles the case where the agent sends no textual reply through dispatcher.
-        // Guard: only clean up if processingTransitionPromise was actually started,
-        // meaning onProcessingStart was called (the agent did begin processing).
-        // Without this guard, completeReaction fires during markDispatchIdle for debounced
-        // messages that are still waiting in the queue (queuedFinal=true scenarios).
-        if (processingTransitionPromise !== null) {
-          completeReaction();
-        }
       },
     });
 
@@ -278,19 +384,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       onModelSelected: prefixContext.onModelSelected,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
-            if (!payload.text || payload.text === lastPartial) {
+            if (!payload.text) {
               return;
             }
-            lastPartial = payload.text;
-            streamText = payload.text;
-            partialUpdateQueue = partialUpdateQueue.then(async () => {
-              if (streamingStartPromise) {
-                await streamingStartPromise;
-              }
-              if (streaming?.isActive()) {
-                await streaming.update(streamText);
-              }
-            });
+            queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });
           }
         : undefined,
     },

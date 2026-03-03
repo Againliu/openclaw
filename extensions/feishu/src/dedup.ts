@@ -1,12 +1,17 @@
 import os from "node:os";
 import path from "node:path";
-import { createDedupeCache, createPersistentDedupe } from "openclaw/plugin-sdk";
+import {
+  createDedupeCache,
+  createPersistentDedupe,
+  readJsonFileWithFallback,
+} from "openclaw/plugin-sdk";
 
 // Persistent TTL: 5 minutes — allows delivery-recovery after gateway restarts
 // while still preventing duplicate messages in normal operation.
 const DEDUP_TTL_MS = 5 * 60 * 1000;
 const MEMORY_MAX_SIZE = 1_000;
 const FILE_MAX_ENTRIES = 10_000;
+type PersistentDedupeData = Record<string, number>;
 
 const memoryDedupe = createDedupeCache({ ttlMs: DEDUP_TTL_MS, maxSize: MEMORY_MAX_SIZE });
 
@@ -41,6 +46,14 @@ export function tryRecordMessage(messageId: string): boolean {
   return !memoryDedupe.check(messageId);
 }
 
+export function hasRecordedMessage(messageId: string): boolean {
+  const trimmed = messageId.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return memoryDedupe.peek(trimmed);
+}
+
 export async function tryRecordMessagePersistent(
   messageId: string,
   namespace = "global",
@@ -51,5 +64,38 @@ export async function tryRecordMessagePersistent(
     onDiskError: (error) => {
       log?.(`feishu-dedup: disk error, falling back to memory: ${String(error)}`);
     },
+  });
+}
+
+export async function hasRecordedMessagePersistent(
+  messageId: string,
+  namespace = "global",
+  log?: (...args: unknown[]) => void,
+): Promise<boolean> {
+  const trimmed = messageId.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const now = Date.now();
+  const filePath = resolveNamespaceFilePath(namespace);
+  try {
+    const { value } = await readJsonFileWithFallback<PersistentDedupeData>(filePath, {});
+    const seenAt = value[trimmed];
+    if (typeof seenAt !== "number" || !Number.isFinite(seenAt)) {
+      return false;
+    }
+    return DEDUP_TTL_MS <= 0 || now - seenAt < DEDUP_TTL_MS;
+  } catch (error) {
+    log?.(`feishu-dedup: persistent peek failed: ${String(error)}`);
+    return false;
+  }
+}
+
+export async function warmupDedupFromDisk(
+  namespace: string,
+  log?: (...args: unknown[]) => void,
+): Promise<number> {
+  return persistentDedupe.warmup(namespace, (error) => {
+    log?.(`feishu-dedup: warmup disk error: ${String(error)}`);
   });
 }
