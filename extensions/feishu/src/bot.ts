@@ -1033,26 +1033,24 @@ export async function handleFeishuMessage(params: {
       `feishu[${account.accountId}]: dispatch complete (queuedFinal=${queuedFinal}, replies=${counts.final})`,
     );
 
-    // FR-001 Smart Fallback Cleanup:
-    // When replies=0, this message produced no reply. Two scenarios:
-    // 1. Another message is active (QUEUED or PROCESSING) in this chat → this was a
-    //    merged message. Trigger onProcessingStart to transition it from OK to Typing,
-    //    and its emoji will be cleaned up by clearForChat when the main reply arrives.
-    // 2. No active message exists → this message was truly discarded (e.g. debounce
-    //    timeout, filters, or all messages got replies=0). Clean up now.
-    // Note: we check hasActiveInChat (not hasProcessingInChat) because the main message
-    // may still be in QUEUED state when this merged message's dispatch returns.
-    if (counts.final === 0) {
-      const cutoffTimestamp = reactionManager.getState(ctx.messageId)?.createdAt ?? Date.now();
-      if (reactionManager.hasActiveInChat(ctx.chatId, cutoffTimestamp, ctx.messageId)) {
-        // Merged message: transition it from OK to Typing so user sees it's being processed
-        await reactionManager.onProcessingStart(ctx.messageId).catch(() => {});
-      } else {
-        // Truly discarded: clean up immediately and explicitly clear any remaining queue
-        // states to prevent zombie emojis when a whole batch is silently dropped
+    // FR-001 Smart Fallback Cleanup / Merged Cleanup:
+    const cutoffTimestamp = reactionManager.getState(ctx.messageId)?.createdAt ?? Date.now();
+
+    if (
+      counts.final === 0 &&
+      reactionManager.hasActiveInChat(ctx.chatId, cutoffTimestamp, ctx.messageId)
+    ) {
+      // Merged message (got batched into another later dispatch):
+      // transition it from OK to Typing so user sees it's still actively being processed by the main request.
+      await reactionManager.onProcessingStart(ctx.messageId).catch(() => {});
+    } else {
+      // Normal flow: The main dispatched message completed successfully (counts.final > 0),
+      // OR an entire batch was truly discarded by filters.
+      // EITHER WAY, we must sweep all reactions from this conversational turn before the cutoff timestamp!
+      if (counts.final === 0) {
         await reactionManager.onCompleted(ctx.messageId);
-        await reactionManager.clearForChat(ctx.chatId, cutoffTimestamp);
       }
+      await reactionManager.clearForChat(ctx.chatId, cutoffTimestamp);
     }
   } catch (err) {
     error(`feishu[${account.accountId}]: failed to dispatch message: ${String(err)}`);

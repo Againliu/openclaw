@@ -2,8 +2,9 @@ import os from "node:os";
 import path from "node:path";
 import { createDedupeCache, createPersistentDedupe } from "openclaw/plugin-sdk";
 
-// Persistent TTL: 24 hours — survives restarts & WebSocket reconnects.
-const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+// Persistent TTL: 5 minutes — allows delivery-recovery after gateway restarts
+// while still preventing duplicate messages in normal operation.
+const DEDUP_TTL_MS = 5 * 60 * 1000;
 const MEMORY_MAX_SIZE = 1_000;
 const FILE_MAX_ENTRIES = 10_000;
 

@@ -91,14 +91,19 @@ export function resolveTranscriptPolicy(params: {
     !OPENAI_COMPAT_TURN_MERGE_EXCLUDED_PROVIDERS.has(provider);
   const isMistral = isMistralModel({ provider, modelId });
   const isOpenRouterGemini =
-    (provider === "openrouter" || provider === "opencode" || provider === "kilocode") &&
+    (provider === "openrouter" ||
+      provider === "opencode" ||
+      provider === "kilocode" ||
+      provider === "openai_or") &&
     modelId.toLowerCase().includes("gemini");
   const isCopilotClaude = provider === "github-copilot" && modelId.toLowerCase().includes("claude");
 
   // GitHub Copilot's Claude endpoints can reject persisted `thinking` blocks with
   // non-binary/non-base64 signatures (e.g. thinkingSignature: "reasoning_text").
   // Drop these blocks at send-time to keep sessions usable.
-  const dropThinkingBlocks = isCopilotClaude;
+  // UPDATE: OpenRouter's Gemini 3 models also throw "Corrupted thought signature"
+  // if history contains thinking or tool call signatures. Force drop them as well.
+  const dropThinkingBlocks = isCopilotClaude || isOpenRouterGemini;
 
   const needsNonImageSanitize = isGoogle || isAnthropic || isMistral || isOpenRouterGemini;
 
